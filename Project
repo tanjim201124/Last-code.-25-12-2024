@@ -1,0 +1,988 @@
+#include <WiFi.h>
+#include<time.h>
+#include <FS.h>
+#include <WebServer.h>
+#include <Wire.h>                    
+#include <LiquidCrystal_I2C.h> 
+#include <Preferences.h>
+#include <Adafruit_Fingerprint.h>
+#include <SoftwareSerial.h>
+#include <SPIFFS.h>
+#include <Keypad.h>
+#include <HTTPClient.h>
+#define MAX_STUDENTS 100  // Adjust this based on the maximum number of students
+
+bool attendedStudents[MAX_STUDENTS] = {false};  // Array to track attendance
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // 16 columns, 2 rows, address is typically 0x27
+Preferences preferences;
+// Define keypad size (rows and columns)
+const byte ROWS = 4; // Four rows
+const byte COLS = 4; // Four columns
+
+// Key mapping
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+
+// Connect keypad rows and columns to GPIO pins on the ESP32S
+byte rowPins[ROWS] = {18, 19, 25, 26}; // Adjust as per your wiring
+byte colPins[COLS] = {23, 5, 4, 15};   // Adjust as per your wiring
+
+// Create a Keypad object
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+
+#define RX_PIN 16
+#define TX_PIN 17
+
+SoftwareSerial mySerial(RX_PIN, TX_PIN);
+Adafruit_Fingerprint finger(&mySerial);
+WebServer server(80);
+
+
+String ssid = "";
+String password = "";
+String coursecode = "";
+
+const char* adminUsername = "admin";
+const char* adminPassword = "admin123";
+const char* teacherDataFile = "/teachers.csv";
+const char* studentDataFile = "/students.csv";
+
+// Connect to Wi-Fi
+bool connectToWiFi(const char* ssid, const char* password) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting...");
+  Serial.print("Connecting to Wi-Fi");
+
+  int timeout = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+    if (timeout > 20) {
+      Serial.println("\nFailed to connect to Wi-Fi");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Wi-Fi Failed");
+      delay(2000);
+      return false;
+    }
+  }
+
+  Serial.println("\nConnected to Wi-Fi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connected");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP().toString());
+
+  return true;
+}
+
+// Start Wi-Fi in AP mode
+void startAccessPoint() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("ESP32_Config", "123456789");
+  Serial.println("Access Point Started");
+  Serial.print("AP IP Address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+// Authenticate User
+bool authenticateUser() {
+  if (!server.authenticate(adminUsername, adminPassword)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
+// Serve the root page after login
+void handleRoot() {
+  if (!authenticateUser()) {
+    return;
+  }
+
+  String wifiStatus = "Not connected";
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiStatus = WiFi.SSID();
+  }
+
+  String htmlPage = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <body>
+        <h2>Admin Dashboard</h2>
+        <p>Current Wi-Fi Status: )rawliteral" + wifiStatus + R"rawliteral(</p>
+        <a href="/wifi">Change Wi-Fi Settings</a><br>
+        <a href="/enrollTeacher">Go to Teacher Enrollment</a><br>
+        <a href="/downloadTeachers">Download Teacher Data</a><br>
+        <a href="/downloadStudents">Download Student Data</a><br>
+        <a href="/enrollStudent">Go to Student Enrollment</a><br>
+
+        <a href="/attendencemode">attendence Mode</a><br>
+        <a href="/downloadAttendance">View Attendence</a><br>
+
+      </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", htmlPage);
+}
+
+// Serve the Wi-Fi settings page
+void handleWifiSettings() {
+  if (!authenticateUser()) {
+    return;
+  }
+
+  String htmlPage = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <body>
+        <h2>Change Wi-Fi Settings</h2>
+        <form action="/saveWifi" method="POST">
+          <label for="ssid">SSID:</label><br>
+          <input type="text" id="ssid" name="ssid" value=")rawliteral" + ssid + R"rawliteral("><br><br>
+          <label for="password">Password:</label><br>
+          <input type="password" id="password" name="password" value=")rawliteral" + password + R"rawliteral("><br><br>
+          <input type="submit" value="Save Wi-Fi Settings">
+        </form>
+      </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", htmlPage);
+}
+
+// Save new Wi-Fi credentials
+void handleSaveWifi() {
+  if (!server.hasArg("ssid") || !server.hasArg("password")) {
+    server.send(400, "text/html", "Missing SSID or password");
+    return;
+  }
+
+  ssid = server.arg("ssid");
+  password = server.arg("password");
+
+  preferences.begin("WiFi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+  preferences.end();
+
+  // Connect to new Wi-Fi
+  if (connectToWiFi(ssid.c_str(), password.c_str())) {
+    server.send(200, "text/html", "<h2>Wi-Fi settings saved. Rebooting...</h2>");
+    delay(2000);
+    ESP.restart();
+  } else {
+    server.send(500, "text/html", "<h2>Failed to connect to Wi-Fi.</h2>");
+  }
+}
+
+// Teacher enrollment page
+void handleEnrollTeacher() {
+  if (!authenticateUser()) {
+    return;
+  }
+
+  String htmlPage = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <body>
+        <h2>Teacher Enrollment</h2>
+        <form action="/enrollTeacherSubmit" method="POST">
+          <label for="teacherId">Teacher ID (SL):</label><br>
+          <input type="text" id="teacherId" name="teacherId"><br><br>
+          <label for="teacherName">Teacher Name:</label><br>
+          <input type="text" id="teacherName" name="teacherName"><br><br>
+          <label for="coursecode">Course Code:</label><br>
+          <input type="text" id="coursecode" name="coursecode"><br><br>
+          <input type="submit" value="Enroll Teacher">
+        </form>
+      </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", htmlPage);
+}
+
+// Enroll a teacher and take attendance
+void enrollTeacher(int teacherId, const String& teacherName, const String& coursecode) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enrol Teacher ID:");
+  
+  delay(2000);
+  Serial.print("Starting enrollment for Teacher ID: ");
+  Serial.println(teacherId);
+
+  // Directly initialize the fingerprint sensor here
+  mySerial.begin(57600);
+  delay(1000);
+  finger.begin(57600);
+
+  int status;
+  while ((status = finger.getImage()) != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Place your finger");
+    lcd.setCursor(0, 1);
+    lcd.print("on the sensor.");
+    delay(2000);
+    Serial.println("Place your finger on the sensor.");
+    delay(1000);
+  }
+
+  Serial.println("Fingerprint image taken.");
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+    Serial.println("Failed to create template.");
+    return;
+  }
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Place same finger");
+  lcd.setCursor(0, 1);
+  lcd.print("on the sensor.");
+  delay(2000);
+  Serial.println("Place the same finger again.");
+  while ((status = finger.getImage()) != FINGERPRINT_OK) {
+    Serial.println("Waiting for second fingerprint image.");
+    delay(1000);
+  }
+
+  if (finger.image2Tz(2) != FINGERPRINT_OK) {
+    Serial.println("Failed to create second template.");
+    return;
+  }
+
+  if (finger.createModel() != FINGERPRINT_OK) {
+    Serial.println("Failed to create fingerprint model.");
+    return;
+  }
+
+  if (finger.storeModel(teacherId) != FINGERPRINT_OK) {
+    Serial.println("Failed to store fingerprint model.");
+    return;
+  }
+   lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("finger print");
+  lcd.setCursor(0, 1);
+  lcd.print("enroll sucesses");
+  delay(2000);
+  Serial.println("Fingerprint enrollment successful.");
+  saveTeacherData(teacherId, teacherName, coursecode);
+}
+
+// Save teacher data to the CSV file
+void saveTeacherData(int teacherId, const String& teacherName, const String& coursecode) {
+  File file = SPIFFS.open(teacherDataFile, FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open teacher data file for appending.");
+    return;
+  }
+
+  String dataLine = String(teacherId) + "," + teacherName + "," + coursecode + "\n";
+  file.print(dataLine);
+  file.close();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Teacher saved:");
+  lcd.setCursor(0, 1);
+  lcd.print(teacherName);
+  delay(2000);
+  Serial.println("Teacher data saved: " + dataLine);
+}
+
+// Serve the teacher data file for download
+void handleDownloadTeachers() {
+  if (!authenticateUser()) {
+    return;
+  }
+
+  File file = SPIFFS.open(teacherDataFile, FILE_READ);
+  if (!file) {
+    server.send(500, "text/html", "<h2>Failed to open teacher data file.</h2>");
+    return;
+  }
+
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+
+// Student enrollment page
+void handleEnrollStudent() {
+  if (!authenticateUser()) {
+    return;
+  }
+
+  String htmlPage = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <body>
+        <h2>Student Enrollment</h2>
+        <form action="/enrollStudentSubmit" method="POST">
+          <label for="studentId">Student ID (SL):</label><br>
+          <input type="text" id="studentId" name="studentId"><br><br>
+          <label for="studentName">Student Name:</label><br>
+          <input type="text" id="studentName" name="studentName"><br><br>
+          <label for="stdroll">Student Roll Number:</label><br>
+          <input type="text" id="stdroll" name="stdroll"><br><br>
+          <input type="submit" value="Enroll Student">
+        </form>
+      </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", htmlPage);
+}
+
+// Enroll a student and take attendance
+void enrollStudent(int studentId, const String& studentName, const String& stdroll) {
+  Serial.print("Starting enrollment for Student ID: ");
+  Serial.println(studentId);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("StR ENR st id");
+  lcd.setCursor(0, 1);
+  lcd.print(stdroll);
+  delay(2000);
+
+  // Directly initialize the fingerprint sensor here
+  mySerial.begin(57600);
+  delay(1000);
+  finger.begin(57600);
+
+  int status;
+  while ((status = finger.getImage()) != FINGERPRINT_OK) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("place :");
+    lcd.setCursor(0, 1);
+    lcd.print("finger");
+    Serial.println("Place your finger on the sensor.");
+    delay(1000);
+  }
+
+  Serial.println("Fingerprint image taken.");
+  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+    Serial.println("Failed to create template.");
+    return;
+  }
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("place same:");
+  lcd.setCursor(0, 1);
+  lcd.print("finger again");
+  delay(2000);
+  Serial.println("Place the same finger again.");
+  while ((status = finger.getImage()) != FINGERPRINT_OK) {
+    Serial.println("Waiting for second fingerprint image.");
+    delay(1000);
+  }
+
+  if (finger.image2Tz(2) != FINGERPRINT_OK) {
+    Serial.println("Failed to create second template.");
+    return;
+  }
+
+  if (finger.createModel() != FINGERPRINT_OK) {
+    Serial.println("Failed to create fingerprint model.");
+    return;
+  }
+
+  if (finger.storeModel(studentId) != FINGERPRINT_OK) {
+    Serial.println("Failed to store fingerprint model.");
+    return;
+  }
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Finferprint Enroll");
+  lcd.setCursor(0, 1);
+  lcd.print("success");
+  delay(2000);
+  Serial.println("Fingerprint enrollment successful.");
+  saveStudentData(studentId, studentName, stdroll);
+}
+
+// Save student data to the CSV file
+void saveStudentData(int studentId, const String& studentName, const String& stdroll) {
+  File file = SPIFFS.open(studentDataFile, FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open student data file for appending.");
+    return;
+  }
+
+  String dataLine = String(studentId) + "," + studentName + "," + stdroll + "\n";
+  file.print(dataLine);
+  file.close();
+
+  Serial.println("Student data saved: " + dataLine);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("stnd saved:");
+  lcd.setCursor(0, 1);
+  lcd.print(stdroll);
+  delay(2000);
+}
+
+// Serve the student data file for download
+void handleDownloadStudents() {
+  if (!authenticateUser()) {
+    return;
+  }
+
+  File file = SPIFFS.open(studentDataFile, FILE_READ);
+  if (!file) {
+    server.send(500, "text/html", "<h2>Failed to open student data file.</h2>");
+    return;
+  }
+
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+// for attensence mode
+
+
+void handleattendencemode() {
+  if (!authenticateUser()) {
+    return;
+  } 
+
+
+  
+
+  // HTML page response for the server (if used in the project)
+  String htmlPage = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <body>
+       <a href="http://192.168.169.25/attendanceMode">
+        <h2>Attendence mode start</h2>
+       </a> 
+      </body>
+    </html>
+  )rawliteral";
+
+  server.send(200, "text/html", htmlPage);
+}
+
+
+
+bool isTeacherFingerprintValid(int teacherId, const String& coursecode) {
+    if (!SPIFFS.exists(teacherDataFile)) {
+        Serial.println("Teacher data file does not exist!");
+        return false;
+    }
+    File file = SPIFFS.open(teacherDataFile, "r"); // Open the teacher CSV file
+    if (!file) {
+        Serial.println("Failed to open teacher data file!");
+        return false;
+    }
+
+    while (file.available()) {
+        
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue; // Skip empty lines
+
+        // Parse CSV line
+        int comma1 = line.indexOf(',');
+        int comma2 = line.lastIndexOf(',');
+
+        if (comma1 == -1 || comma2 == -1 || comma1 == comma2) continue;
+
+        String idStr = line.substring(0, comma1);
+        String courseCodeStr = line.substring(comma2 + 1);
+
+        if (idStr.toInt() == teacherId && courseCodeStr.equalsIgnoreCase(coursecode)) {
+            file.close();
+            return true; // Valid teacher ID and course code found
+        }
+    }
+
+    file.close();
+    return false; // Teacher ID and course code do not match
+}
+
+
+
+
+int getFingerprintID() {
+    uint8_t p = finger.getImage();
+    if (p == FINGERPRINT_NOFINGER) {
+        Serial.println("No finger detected. Waiting for input...");
+        return -1;  // Return early if no finger is detected
+    }
+
+    if (p != FINGERPRINT_OK) {
+        Serial.println("Error capturing fingerprint image.");
+        return -1;  // Handle other capture errors
+    }
+
+    p = finger.image2Tz();
+    if (p != FINGERPRINT_OK) {
+        Serial.println("Error converting fingerprint image.");
+        return -1;
+    }
+
+    p = finger.fingerFastSearch();
+    if (p != FINGERPRINT_OK) {
+        Serial.println("No matching fingerprint found.");
+        return -1;
+    }
+
+    return finger.fingerID; // Return the ID of the matched fingerprint
+}
+
+
+
+
+void clearSensorBuffer() {
+    while (finger.getImage() != FINGERPRINT_NOFINGER) {
+        delay(100); // Wait until the sensor reports no finger
+    }
+}
+
+
+bool verifyTeacherFingerprint(String coursecode) {
+    int teacherId;
+    clearSensorBuffer();  // Ensure the sensor buffer is clear before starting
+
+    while (true) {
+        teacherId = getFingerprintID();  // Fetch fingerprint ID
+        if (teacherId == -1) {
+            Serial.println("No fingerprint detected. Please place your finger.");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("No finger found");
+            lcd.setCursor(0, 1);
+            lcd.print("Try again...");
+            delay(2000);
+            continue;  // Keep waiting until a fingerprint is detected
+        }
+
+        // Check if the fingerprint matches the teacher ID and course code
+        if (isTeacherFingerprintValid(teacherId, coursecode)) {
+            Serial.println("Teacher fingerprint verified successfully.");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Verification");
+            lcd.setCursor(0, 1);
+            lcd.print("Success!");
+            delay(2000);
+            return true;  // Verification successful
+        } else {
+            Serial.println("Fingerprint detected but verification failed.");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Verification");
+            lcd.setCursor(0, 1);
+            lcd.print("Failed!");
+            delay(2000);
+            return false;  // Verification failed
+        }
+    }
+}
+
+
+
+int processStudentAttendance(const String &coursecode) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Scan Student Finger");
+    Serial.println("Awaiting student fingerprint...");
+
+    while (true) {
+        int result = finger.getImage();  // Get fingerprint image
+        if (result == FINGERPRINT_NOFINGER) {
+            delay(100);
+            continue;  // Keep waiting for a finger
+        }
+
+        if (result != FINGERPRINT_OK) {
+            Serial.println("Error capturing fingerprint image.");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Error Reading");
+            lcd.setCursor(0, 1);
+            lcd.print("Try Again");
+            delay(2000);
+            return -2;  // Error reading fingerprint
+        }
+
+        result = finger.image2Tz();
+        if (result != FINGERPRINT_OK) {
+            Serial.println("Error converting fingerprint image.");
+            return -2;
+        }
+
+        result = finger.fingerFastSearch();
+        if (result != FINGERPRINT_OK) {
+            Serial.println("Fingerprint not recognized!");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Invalid Finger");
+            delay(2000);
+            return -1;  // Fingerprint not recognized
+        }
+
+        int studentId = finger.fingerID;  // Get the fingerprint ID
+        if (studentId < 0 || studentId >= MAX_STUDENTS) {
+            Serial.println("Invalid student ID.");
+            return -1;
+        }
+
+        if (attendedStudents[studentId]) {
+            Serial.println("Duplicate attendance detected.");
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Already Marked");
+            lcd.setCursor(0, 1);
+            lcd.print("Attendance");
+            delay(2000);
+            return -3;  // Duplicate attendance
+        }
+
+        attendedStudents[studentId] = true;  // Mark this student as attended
+        Serial.println("Fingerprint recognized. ID: " + String(studentId));
+        return studentId;  // Return valid student ID
+    }
+}
+
+
+
+
+String fetchStudentName(int studentId) {
+  File studentFile = SPIFFS.open("/students.csv", FILE_READ);
+  if (!studentFile) {
+    Serial.println("Failed to open student file!");
+    return "";
+  }
+
+  while (studentFile.available()) {
+    String line = studentFile.readStringUntil('\n');
+    int idIndex = line.indexOf(',');
+    int nameIndex = line.lastIndexOf(',');
+
+    String id = line.substring(0, idIndex);
+    String name = line.substring(idIndex + 1, nameIndex);
+
+    if (id.toInt() == studentId) {
+      studentFile.close();
+      return name;
+    }
+  }
+
+  studentFile.close();
+  return "Unknown Student";
+}
+
+
+void attendanceMode() {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Attendance Mode");
+    lcd.setCursor(0, 1);
+    lcd.print("Starting...");
+    Serial.println("Attendance mode started.");
+
+    String coursecode = "";
+
+    // Reset the attendance tracking array
+    memset(attendedStudents, false, sizeof(attendedStudents));
+
+    // Prompt for course code
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Enter Course Code:");
+    Serial.println("Awaiting course code...");
+
+    while (true) {
+        char key = keypad.getKey();
+        if (key) {
+            if (key == '#') {  // End of input
+                Serial.println("Course code entered: " + coursecode);
+                break;
+            } else {
+                coursecode += key;
+                lcd.print(key);
+                Serial.print(key);
+            }
+        }
+    }
+
+    // Verify teacher fingerprint
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Verify Teacher...");
+    Serial.println("Place teacher's finger on the sensor.");
+
+    if (!verifyTeacherFingerprint(coursecode)) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Verification Failed");
+        Serial.println("Teacher fingerprint verification failed.");
+        delay(3000);
+        return;
+    }
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Attendance Start");
+    Serial.println("Attendance started for course: " + coursecode);
+
+    while (true) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Awaiting Student");
+
+        int studentId = processStudentAttendance(coursecode);
+        if (studentId == -1) {
+            Serial.println("Invalid fingerprint. Attendance not recorded.");
+        } else if (studentId == -3) {
+            Serial.println("Duplicate attendance. Skipping.");
+        } else if (studentId > 0) {
+            String studentName = fetchStudentName(studentId);
+            if (!studentName.isEmpty()) {
+                saveAttendance(coursecode, studentName, studentId);
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Marked for:");
+                lcd.setCursor(0, 1);
+                lcd.print(studentName);
+                Serial.println("Attendance recorded for: " + studentName);
+                delay(2000);
+            } else {
+                Serial.println("Student not found in database.");
+                lcd.clear();
+                lcd.setCursor(0, 0);
+                lcd.print("Unknown Student");
+                delay(2000);
+            }
+        }
+
+        // Allow teacher to end attendance session
+        if (verifyTeacherFingerprint(coursecode)) {
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("Attendance Ended");
+            Serial.println("Attendance session ended.");
+            delay(3000);
+            break;
+        }
+    }
+}
+
+
+
+void saveAttendance(String coursecode, String studentName, int studentId) {
+    // Get the current date and time
+    time_t now = time(nullptr);
+    struct tm *localTime = localtime(&now);
+
+    // Format the date and time as a string
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localTime);
+
+    // Open the attendance file for appending
+    File attendanceFile = SPIFFS.open("/attendance.csv", FILE_APPEND);
+    if (!attendanceFile) {
+        Serial.println("Failed to open attendance file!");
+        return;
+    }
+
+    // Save the attendance record
+    String record = coursecode + "," + studentName + "," + String(studentId) + "," + String(timestamp) + "\n";
+    attendanceFile.print(record);
+    attendanceFile.close();
+    Serial.println("Attendance saved: " + record);
+}
+
+void handleDownloadAttendance() {
+    // Ensure user is authenticated
+    if (!authenticateUser()) {
+        return;
+    }
+
+    // Check if the attendance file exists
+    if (!SPIFFS.exists("/attendance.csv")) {
+        server.send(404, "text/plain", "Attendance file not found.");
+        Serial.println("Attendance file not found.");
+        return;
+    }
+
+    // Open the attendance file for reading
+    File attendanceFile = SPIFFS.open("/attendance.csv", FILE_READ);
+    if (!attendanceFile) {
+        server.send(500, "text/plain", "Failed to open attendance file.");
+        Serial.println("Failed to open attendance file.");
+        return;
+    }
+
+    // Serve the file
+    server.streamFile(attendanceFile, "text/csv");
+    attendanceFile.close();
+    Serial.println("Attendance file served successfully.");
+}
+
+
+
+// Function to delete all the CSV files
+void deleteAllCSVFiles() {
+  // Check and delete teachers.csv
+  if (SPIFFS.exists(teacherDataFile)) {
+    if (SPIFFS.remove(teacherDataFile)) {
+      Serial.println("teachers.csv file deleted successfully.");
+    } else {
+      Serial.println("Failed to delete teachers.csv file.");
+    }
+  } else {
+    Serial.println("teachers.csv file does not exist.");
+  }
+
+  // Check and delete students.csv
+  if (SPIFFS.exists(studentDataFile)) {
+    if (SPIFFS.remove(studentDataFile)) {
+      Serial.println("students.csv file deleted successfully.");
+    } else {
+      Serial.println("Failed to delete students.csv file.");
+    }
+  } else {
+    Serial.println("students.csv file does not exist.");
+  }
+
+  // Check and delete attendance.csv
+  if (SPIFFS.exists("/attendance.csv")) {
+    if (SPIFFS.remove("/attendance.csv")) {
+      Serial.println("attendance.csv file deleted successfully.");
+    } else {
+      Serial.println("Failed to delete attendance.csv file.");
+    }
+  } else {
+    Serial.println("attendance.csv file does not exist.");
+  }
+}
+
+// Call this function through an HTTP endpoint or directly in the code
+void handleDeleteAllCSVFiles() {
+  if (!authenticateUser()) {
+    return;
+  }
+  
+  deleteAllCSVFiles();
+  server.send(200, "text/html", "<h2>All CSV files deleted successfully!</h2>");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+void setup() {
+  
+  Serial.begin(115200);
+  mySerial.begin(57600); // Start serial for the sensor
+  finger.begin(57600);   // Initialize the Adafruit Fingerprint library
+
+  if (finger.verifyPassword()) {
+        Serial.println("Fingerprint sensor detected!");
+  } else {
+        Serial.println("Fingerprint sensor not detected or communication error.");
+        while (1) delay(1000); // Halt execution if the sensor is not detected
+  }
+  preferences.begin("WiFi", false);
+
+  SPIFFS.begin();
+  if (!SPIFFS.begin(true)) { // Format SPIFFS if mounting fails
+        Serial.println("Failed to mount SPIFFS!");
+        return;
+    }
+    Serial.println("SPIFFS mounted successfully.");
+
+  
+  Wire.begin(21,22);                      // Start I2C bus
+  lcd.begin(16, 2);                   // Initialize LCD (16 columns, 2 rows)
+  lcd.backlight();  
+
+  ssid = preferences.getString("ssid", "");
+  password = preferences.getString("password", "");
+  lcd.setCursor(0, 0);    // Set cursor to first row, first column
+  lcd.print("Connecting...");
+  
+
+  if (ssid == "" || password == "") {
+    startAccessPoint();
+  } else {
+    // Try connecting to saved Wi-Fi network
+    if (!connectToWiFi(ssid.c_str(), password.c_str())) {
+      startAccessPoint();
+    }
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/wifi", HTTP_GET, handleWifiSettings);
+  server.on("/saveWifi", HTTP_POST, handleSaveWifi);
+  server.on("/enrollTeacher", HTTP_GET, handleEnrollTeacher);
+  server.on("/enrollTeacherSubmit", HTTP_POST, []() {
+    String teacherId = server.arg("teacherId");
+    String teacherName = server.arg("teacherName");
+    String coursecode = server.arg("coursecode");
+
+    enrollTeacher(teacherId.toInt(), teacherName, coursecode);
+    server.send(200, "text/html", "<h2>Teacher enrolled successfully!</h2>");
+  });
+  server.on("/downloadTeachers", HTTP_GET, handleDownloadTeachers);
+  server.on("/enrollStudent", HTTP_GET, handleEnrollStudent);
+  server.on("/enrollStudentSubmit", HTTP_POST, []() {
+    String studentId = server.arg("studentId");
+    String studentName = server.arg("studentName");
+    String stdroll = server.arg("stdroll");
+
+    enrollStudent(studentId.toInt(), studentName, stdroll);
+    server.send(200, "text/html", "<h2>Student enrolled successfully!</h2>");
+  });
+  server.on("/downloadStudents", HTTP_GET, handleDownloadStudents);
+  server.on("/attendencemode", HTTP_GET, handleattendencemode);
+  server.on("/attendanceMode", HTTP_GET, attendanceMode);
+  server.on("/deleteAllFiles", HTTP_GET, handleDeleteAllCSVFiles);
+  server.on("/downloadAttendance", HTTP_GET, handleDownloadAttendance);
+ 
+  
+  
+  
+
+  server.begin();
+}
+
+
+ // To hold the entered characters
+
+
+  
+ 
+
+void loop() {
+
+  server.handleClient();
+ 
+
+}
